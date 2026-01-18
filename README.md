@@ -56,9 +56,12 @@ cd soc_analyst_suite
 curl -LsSf https://astral.sh/uv/install.sh | sh
 # Or on Windows: powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-# Create virtual environment and install dependencies
+# Add uv to PATH (restart shell or run one of these):
+source $HOME/.local/bin/env       # bash/zsh
+source $HOME/.local/bin/env.fish  # fish
+
+# Create virtual environment
 uv venv
-uv pip install -r requirements.txt
 
 # Activate virtual environment
 # Linux/Mac (bash/zsh):
@@ -72,9 +75,12 @@ source .venv/bin/activate.fish
 
 # Windows (CMD):
 .venv\Scripts\activate.bat
+
+# Install dependencies
+uv pip install -r requirements.txt
 ```
 
-> **Note:** `uv` is a fast Python package installer written in Rust. It's 10-100x faster than pip. If you prefer pip, use `python -m venv venv && pip install -r requirements.txt` instead.
+> **Note:** `uv` is a fast Python package installer written in Rust. It's 10-100x faster than pip. If you prefer pip, use `python -m venv .venv && pip install -r requirements.txt` instead.
 
 ### Start MongoDB
 
