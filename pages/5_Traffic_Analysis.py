@@ -20,6 +20,64 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
+# Try to import Scapy
+SCAPY_AVAILABLE = False
+HAS_ROOT = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+
+try:
+    from scapy.all import sniff, IP, TCP, UDP, ICMP, conf
+    SCAPY_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def capture_live_traffic(interface: str, duration: int, packet_count: int = 1000) -> list:
+    """Capture live traffic using Scapy"""
+    captured_packets = []
+    
+    def packet_callback(pkt):
+        if IP in pkt:
+            packet_info = {
+                "timestamp": datetime.now().isoformat(),
+                "src_ip": pkt[IP].src,
+                "dst_ip": pkt[IP].dst,
+                "src_port": 0,
+                "dst_port": 0,
+                "protocol": "OTHER",
+                "bytes": len(pkt),
+                "packets": 1
+            }
+            
+            if TCP in pkt:
+                packet_info["protocol"] = "TCP"
+                packet_info["src_port"] = pkt[TCP].sport
+                packet_info["dst_port"] = pkt[TCP].dport
+                # Identify HTTP/HTTPS
+                if pkt[TCP].dport == 80 or pkt[TCP].sport == 80:
+                    packet_info["protocol"] = "HTTP"
+                elif pkt[TCP].dport == 443 or pkt[TCP].sport == 443:
+                    packet_info["protocol"] = "HTTPS"
+            elif UDP in pkt:
+                packet_info["protocol"] = "UDP"
+                packet_info["src_port"] = pkt[UDP].sport
+                packet_info["dst_port"] = pkt[UDP].dport
+                # Identify DNS
+                if pkt[UDP].dport == 53 or pkt[UDP].sport == 53:
+                    packet_info["protocol"] = "DNS"
+            elif ICMP in pkt:
+                packet_info["protocol"] = "ICMP"
+            
+            captured_packets.append(packet_info)
+    
+    try:
+        # Suppress Scapy warnings
+        conf.verb = 0
+        sniff(iface=interface, prn=packet_callback, timeout=duration, count=packet_count, store=0)
+    except Exception as e:
+        st.error(f"Capture error: {str(e)}")
+    
+    return captured_packets
+
 st.set_page_config(page_title="Traffic Analysis", page_icon="📡", layout="wide")
 
 st.markdown("# 📡 Traffic Analysis")
@@ -45,11 +103,15 @@ with col3:
     st.markdown("<br>", unsafe_allow_html=True)
     capture_btn = st.button("🔴 Start Capture", type="primary", use_container_width=True)
 
-# Simulated traffic data for demonstration
-if "traffic_data" not in st.session_state:
+# Check capture capabilities
+if not SCAPY_AVAILABLE:
+    st.warning("⚠️ Scapy not installed. Install with: `pip install scapy`")
+elif not HAS_ROOT:
+    st.warning("⚠️ Live capture requires root privileges. Run with: `sudo streamlit run app.py`")
+
+# Generate sample traffic data for initial display
+def generate_sample_data():
     import random
-    
-    # Generate sample traffic data
     protocols = ["TCP", "UDP", "ICMP", "HTTP", "HTTPS", "DNS", "MQTT"]
     ips = [f"192.168.1.{i}" for i in range(1, 50)]
     
@@ -67,11 +129,22 @@ if "traffic_data" not in st.session_state:
             "bytes": random.randint(64, 15000),
             "packets": random.randint(1, 50)
         })
-    
-    st.session_state.traffic_data = sample_data
+    return sample_data
+
+if "traffic_data" not in st.session_state:
+    st.session_state.traffic_data = generate_sample_data()
 
 if capture_btn:
-    st.info(f"⚠️ Live capture requires Scapy and admin privileges. Showing sample data.")
+    if SCAPY_AVAILABLE and HAS_ROOT:
+        with st.spinner(f"🔴 Capturing traffic on {interface} for {capture_duration} seconds..."):
+            captured = capture_live_traffic(interface, capture_duration)
+            if captured:
+                st.session_state.traffic_data = captured
+                st.success(f"✅ Captured {len(captured)} packets!")
+            else:
+                st.warning("⚠️ No packets captured. Check interface name or network activity.")
+    else:
+        st.info("⚠️ Live capture not available. Showing sample data.")
 
 st.markdown("---")
 

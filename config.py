@@ -28,10 +28,14 @@ COLLECTION_TRAFFIC = "traffic_logs"
 # Path to Suricata EVE JSON log
 SURICATA_EVE_PATH = os.getenv(
     "SURICATA_EVE_PATH",
-    r"C:\Program Files\Suricata\log\eve.json"  # Windows default
+    "/var/log/suricata/eve.json"  # Linux default
 )
-# Alternative Linux path
-# SURICATA_EVE_PATH = "/var/log/suricata/eve.json"
+
+# Suricata config path
+SURICATA_CONFIG_PATH = os.getenv(
+    "SURICATA_CONFIG_PATH",
+    "/etc/suricata/suricata.yaml"
+)
 
 # =============================================================================
 # Nmap Configuration
@@ -72,8 +76,9 @@ NVD_RATE_LIMIT_DELAY = 0.6 if NVD_API_KEY else 6.0  # Seconds between requests
 # =============================================================================
 # Scapy / Traffic Analysis
 # =============================================================================
-# Network interface for packet capture
-CAPTURE_INTERFACE = os.getenv("CAPTURE_INTERFACE", "Ethernet2")  # Windows interface name
+# Network interface for packet capture (use 'ip addr' to find yours)
+CAPTURE_INTERFACE = os.getenv("CAPTURE_INTERFACE", "wlp0s20f3")  # Linux WiFi interface
+HOTSPOT_INTERFACE = os.getenv("HOTSPOT_INTERFACE", "wlp0s20f3")  # Hotspot interface
 CAPTURE_TIMEOUT = 60  # seconds
 MAX_PACKETS_DISPLAY = 1000
 
@@ -112,3 +117,9 @@ EXPORT_DIR.mkdir(exist_ok=True)
 # =============================================================================
 DEFAULT_PAGE_SIZE = 50
 MAX_ALERTS_DISPLAY = 500
+
+# =============================================================================
+# System Authentication (for sudo commands)
+# =============================================================================
+# WARNING: Store this securely, preferably in .env file, not in code!
+SUDO_PASSWORD = os.getenv("SUDO_PASSWORD", "")
