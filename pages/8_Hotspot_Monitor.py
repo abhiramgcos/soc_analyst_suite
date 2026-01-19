@@ -372,7 +372,7 @@ def get_hotspot_subnet(interface):
 
 
 def nmap_discover_devices(interface=None, subnet=None):
-    """Discover devices on the network using nmap"""
+    """Discover devices on the network using nmap (no root required for basic scan)"""
     if not check_tool_available("nmap"):
         return None, "nmap not installed. Install with: sudo apt install nmap"
     
@@ -383,17 +383,27 @@ def nmap_discover_devices(interface=None, subnet=None):
     
     devices = []
     try:
-        # Quick ping scan
+        # Try with sudo first for MAC address detection
         result = run_sudo_command(
-            ["nmap", "-sn", "-T4", subnet],
+            ["nmap", "-sn", "-T4", "--no-stylesheet", subnet],
             timeout=60
         )
+        
+        # If sudo fails, try without sudo (won't get MAC addresses)
+        if result is None or (result.returncode != 0 and result.stderr):
+            result = subprocess.run(
+                ["nmap", "-sn", "-T4", "--no-stylesheet", subnet],
+                capture_output=True, text=True, timeout=60
+            )
         
         if result is None:
             return None, "nmap scan timed out"
         
-        if result.returncode != 0 and "root" in result.stderr.lower():
-            return None, "nmap requires root privileges"
+        if result.returncode != 0:
+            stderr = result.stderr if hasattr(result, 'stderr') and result.stderr else ""
+            if "root" in stderr.lower() or "privileges" in stderr.lower():
+                return None, "nmap requires root privileges. Set SUDO_PASSWORD in .env"
+            return None, f"nmap failed: {stderr[:100]}"
         
         # Parse nmap output
         current_host = {}
@@ -434,25 +444,34 @@ def nmap_discover_devices(interface=None, subnet=None):
         
         return devices, f"Found {len(devices)} devices via nmap"
     
+    except subprocess.TimeoutExpired:
+        return None, "nmap scan timed out"
     except Exception as e:
         return None, str(e)
 
 def nmap_discover_devices_enhanced(interface=None, subnet=None):
-    """Enhanced nmap discovery with OS detection (requires sudo)"""
+    """Enhanced nmap discovery with service detection (uses sudo for better results)"""
     if not subnet and interface:
         subnet = get_hotspot_subnet(interface)
     elif not subnet:
         subnet = "10.42.0.0/24"
         
     try:
-        # -O: Enable OS detection
-        # -F: Fast mode
-        # --osscan-limit: Limit OS detection to promising hosts
-        cmd = ["nmap", "-O", "-F", "--osscan-limit", subnet]
+        # Use -sV for service detection instead of -O (OS detection requires root)
+        # -F: Fast mode (top 100 ports)
+        # --version-light: Light version detection (faster)
+        cmd = ["nmap", "-sV", "-F", "--version-light", "--no-stylesheet", subnet]
         result = run_sudo_command(cmd, timeout=120)
         
-        if result is None or result.returncode != 0:
-            return nmap_discover_devices(interface, subnet) # Fallback
+        if result is None:
+            return nmap_discover_devices(interface, subnet)  # Fallback to basic scan
+        
+        if result.returncode != 0:
+            stderr = result.stderr if result.stderr else ""
+            if "root" in stderr.lower() or "privileges" in stderr.lower():
+                # Fall back to basic scan without sudo
+                return nmap_discover_devices(interface, subnet)
+            return nmap_discover_devices(interface, subnet)
             
         devices = []
         current_host = {}
@@ -463,7 +482,7 @@ def nmap_discover_devices_enhanced(interface=None, subnet=None):
             if line.startswith('Nmap scan report for'):
                 if current_host.get('ip'):
                     devices.append(current_host)
-                current_host = {"source": "nmap-deep"}
+                current_host = {"source": "nmap-enhanced", "mac": "Unknown", "vendor": "Unknown"}
                 
                 match = re.search(r'for\s+(?:(\S+)\s+\()?(\d+\.\d+\.\d+\.\d+)', line)
                 if match:
@@ -489,28 +508,37 @@ def nmap_discover_devices_enhanced(interface=None, subnet=None):
         if current_host.get('ip'):
             devices.append(current_host)
             
-        return devices, f"Deep scan found {len(devices)} devices"
+        return devices, f"Enhanced scan found {len(devices)} devices"
             
     except Exception as e:
+        # Fallback to basic scan on any error
         return nmap_discover_devices(interface, subnet)
-    
-    except Exception as e:
-        return None, str(e)
 
 
 def nmap_port_scan(ip, ports="22,80,443,8080,3389"):
-    """Quick port scan on a specific device"""
+    """Quick port scan on a specific device (works without root for TCP connect scan)"""
     if not check_tool_available("nmap"):
         return None, "nmap not installed"
     
     try:
+        # Try with sudo first for SYN scan (faster, more reliable)
         result = run_sudo_command(
-            ["nmap", "-T4", "-p", ports, "--open", ip],
+            ["nmap", "-sS", "-T4", "-p", ports, "--open", "--no-stylesheet", ip],
             timeout=30
         )
         
+        # If sudo fails, fall back to TCP connect scan (no root required)
+        if result is None or result.returncode != 0:
+            result = subprocess.run(
+                ["nmap", "-sT", "-T4", "-p", ports, "--open", "--no-stylesheet", ip],
+                capture_output=True, text=True, timeout=30
+            )
+        
         if result is None:
             return None, "Scan timed out"
+        
+        if result.returncode != 0:
+            return None, f"Scan failed: {result.stderr[:100] if result.stderr else 'Unknown error'}"
         
         open_ports = []
         for line in result.stdout.split('\n'):
@@ -525,6 +553,8 @@ def nmap_port_scan(ip, ports="22,80,443,8080,3389"):
         
         return open_ports, f"Scanned {ip}"
     
+    except subprocess.TimeoutExpired:
+        return None, "Scan timed out"
     except Exception as e:
         return None, str(e)
 
