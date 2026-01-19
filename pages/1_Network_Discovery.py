@@ -1,6 +1,6 @@
 """
 Page 1: Network Discovery
-Scan and discover IoT devices on the network using Nmap
+Scan and discover IoT devices on the network using Nmap, Scapy, and ARP
 """
 import streamlit as st
 import pandas as pd
@@ -13,6 +13,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import DEFAULT_SUBNET, NMAP_PATH
 from backend.db import list_devices, upsert_device, delete_device, get_device_stats
 from backend.nmap_scanner import scan_network, quick_scan, scan_with_scapy
+from backend.network_scanner import (
+    arp_scan, full_network_scan, lookup_oui_vendor, 
+    get_default_gateway, SCAPY_AVAILABLE, PYTHON_NMAP_AVAILABLE
+)
 import requests
 
 @st.cache_data(ttl=3600*24)
@@ -27,10 +31,48 @@ def get_mac_vendor_online(mac):
         pass
     return "Unknown"
 
+
+def get_mac_vendor(mac):
+    """Get MAC vendor - try local first, then online"""
+    # Try local OUI database first (faster)
+    vendor = lookup_oui_vendor(mac)
+    if vendor != "Unknown":
+        return vendor
+    # Fall back to online lookup
+    return get_mac_vendor_online(mac)
+
 st.set_page_config(page_title="Network Discovery", page_icon="🔍", layout="wide")
 
 st.markdown("# 🔍 Network Discovery")
-st.markdown("Discover and catalog IoT devices on your network using Nmap scanning.")
+st.markdown("Discover and catalog IoT devices on your network using **multiple scan methods**: Nmap, Scapy ARP, and ping discovery.")
+
+# Show available tools
+with st.expander("🛠️ Scanner Status", expanded=False):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if SCAPY_AVAILABLE:
+            st.success("✅ Scapy ARP Scanner")
+        else:
+            st.warning("⚠️ Scapy not installed")
+            st.caption("Install: `pip install scapy`")
+    with col2:
+        if PYTHON_NMAP_AVAILABLE:
+            st.success("✅ Python-Nmap")
+        else:
+            st.warning("⚠️ python-nmap not installed")
+            st.caption("Install: `pip install python-nmap`")
+    with col3:
+        # Check if nmap binary is available
+        import subprocess
+        try:
+            result = subprocess.run(["which", "nmap"], capture_output=True, timeout=5)
+            if result.returncode == 0:
+                st.success("✅ Nmap Binary")
+            else:
+                st.error("❌ Nmap not found")
+                st.caption("Install: `sudo apt install nmap`")
+        except:
+            st.error("❌ Nmap check failed")
 
 # Scan controls
 st.markdown("### 📡 Network Scan")
@@ -41,7 +83,14 @@ with col1:
     subnet = st.text_input("Target Subnet", value=DEFAULT_SUBNET, placeholder="192.168.1.0/24")
 
 with col2:
-    scan_type = st.selectbox("Scan Type", ["Quick (Ping)", "Standard (Service Detection)", "Intensive", "Deep Scan (OS + Scapy)"])
+    scan_type = st.selectbox("Scan Type", [
+        "Quick ARP (Fastest)",
+        "Quick (Ping)", 
+        "Standard (Service Detection)", 
+        "Intensive",
+        "Deep Scan (OS + Scapy)",
+        "Full Scan (ARP + Nmap)"
+    ])
 
 with col3:
     st.markdown("<br>", unsafe_allow_html=True)
@@ -58,45 +107,107 @@ if scan_button and not st.session_state.scan_in_progress:
     st.session_state.scan_in_progress = True
     
     with st.spinner(f"Scanning {subnet}... This may take a few minutes."):
-        if scan_type == "Quick (Ping)":
+        result = {"success": False, "devices": [], "error": None, "scan_time": 0}
+        
+        if scan_type == "Quick ARP (Fastest)":
+            # Fast ARP-only scan using new network_scanner
+            if SCAPY_AVAILABLE:
+                import time
+                start = time.time()
+                devices = arp_scan(subnet)
+                elapsed = time.time() - start
+                
+                # Convert to standard format
+                result["success"] = True
+                result["scan_time"] = elapsed
+                result["devices"] = [{
+                    "ip": d["ip"],
+                    "mac": d["mac"],
+                    "hostname": "",
+                    "device_type": "Unknown",
+                    "os": "Unknown",
+                    "ports": [],
+                    "risk_score": 0.0,
+                    "tags": ["arp-discovered"],
+                    "vendor": d.get("vendor", "Unknown")
+                } for d in devices]
+            else:
+                result["error"] = "Scapy not available. Install with: pip install scapy"
+                
+        elif scan_type == "Full Scan (ARP + Nmap)":
+            # Combined ARP discovery + Nmap enrichment
+            import time
+            start = time.time()
+            
+            progress_bar = st.progress(0, text="Discovering devices...")
+            
+            def update_progress(device, idx, total):
+                progress_bar.progress((idx + 1) / total, text=f"Scanning {device['ip']} ({idx+1}/{total})...")
+            
+            devices = full_network_scan(
+                subnet,
+                include_nmap=True,
+                callback=update_progress
+            )
+            
+            elapsed = time.time() - start
+            progress_bar.empty()
+            
+            result["success"] = True
+            result["scan_time"] = elapsed
+            result["devices"] = [{
+                "ip": d.get("ip", ""),
+                "mac": d.get("mac", "Unknown"),
+                "hostname": d.get("hostname", ""),
+                "device_type": d.get("device_type", "Unknown"),
+                "os": d.get("os", "Unknown"),
+                "ports": d.get("ports", []),
+                "risk_score": 0.0,
+                "tags": [d.get("source", "scan")],
+                "vendor": d.get("vendor", "Unknown")
+            } for d in devices]
+            
+        elif scan_type == "Quick (Ping)":
             result = quick_scan(subnet)
         else:
             if scan_type == "Deep Scan (OS + Scapy)":
                 options = "-sV -O -A -T4 --open"
-            else:
-                 options = "-sV -O -T4 --open" if scan_type == "Standard (Service Detection)" else "-sV -sC -O -A -T4 --open"
+            elif scan_type == "Standard (Service Detection)":
+                options = "-sV -O -T4 --open"
+            else:  # Intensive
+                options = "-sV -sC -O -A -T4 --open"
             
             result = scan_network(subnet, options=options)
             
             # If Deep Scan, also run Scapy to ensure we get MACs even if Nmap failed (e.g. different subnet/layer 2 issues)
             if scan_type == "Deep Scan (OS + Scapy)" and result["success"]:
-                 st.info("Running parallel Scapy scan for accurate MAC detection...")
-                 scapy_devices = scan_with_scapy(subnet)
-                 
-                 # Merge Scapy results
-                 if scapy_devices:
-                     for s_dev in scapy_devices:
-                         # Find matching device in result
-                         existing = next((d for d in result["devices"] if d["ip"] == s_dev["ip"]), None)
-                         if existing:
-                             if existing["mac"] == "Unknown":
-                                 existing["mac"] = s_dev.get("mac", "Unknown")
-                                 existing["vendor"] = s_dev.get("vendor", "Unknown")
-                         else:
-                             # Add new device found only by Scapy
-                             result["devices"].append({
-                                 "ip": s_dev["ip"],
-                                 "mac": s_dev.get("mac", "Unknown"),
-                                 "hostname": "",
-                                 "device_type": "Unknown",
-                                 "os": "Unknown",
-                                 "ports": [],
-                                 "risk_score": 0.0,
-                                 "tags": ["scapy-discovered"],
-                                 "vendor": s_dev.get("vendor", "Unknown")
-                             })
+                st.info("Running parallel Scapy scan for accurate MAC detection...")
+                scapy_devices = scan_with_scapy(subnet)
+                
+                # Merge Scapy results
+                if scapy_devices:
+                    for s_dev in scapy_devices:
+                        # Find matching device in result
+                        existing = next((d for d in result["devices"] if d["ip"] == s_dev["ip"]), None)
+                        if existing:
+                            if existing["mac"] == "Unknown":
+                                existing["mac"] = s_dev.get("mac", "Unknown")
+                                existing["vendor"] = s_dev.get("vendor", "Unknown")
+                        else:
+                            # Add new device found only by Scapy
+                            result["devices"].append({
+                                "ip": s_dev["ip"],
+                                "mac": s_dev.get("mac", "Unknown"),
+                                "hostname": "",
+                                "device_type": "Unknown",
+                                "os": "Unknown",
+                                "ports": [],
+                                "risk_score": 0.0,
+                                "tags": ["scapy-discovered"],
+                                "vendor": s_dev.get("vendor", "Unknown")
+                            })
     
-                     st.write(f"Scapy scan enriched {len(scapy_devices)} devices")
+                    st.write(f"Scapy scan enriched {len(scapy_devices)} devices")
     
     st.session_state.scan_in_progress = False
     st.session_state.scan_results = result
@@ -107,9 +218,9 @@ if scan_button and not st.session_state.scan_in_progress:
         for device in result["devices"]:
             # Enrich vendor if unknown
             if device.get("mac") and len(device["mac"]) > 8 and (not device.get("vendor") or device["vendor"] == "Unknown"):
-                 vendor = get_mac_vendor_online(device["mac"])
-                 if vendor != "Unknown":
-                     device["vendor"] = vendor
+                vendor = get_mac_vendor(device["mac"])
+                if vendor != "Unknown":
+                    device["vendor"] = vendor
             
             if upsert_device(device):
                 saved_count += 1
