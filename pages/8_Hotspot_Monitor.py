@@ -13,6 +13,7 @@ import re
 import tempfile
 import threading
 import time as time_module
+import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -436,6 +437,66 @@ def nmap_discover_devices(interface=None, subnet=None):
     except Exception as e:
         return None, str(e)
 
+def nmap_discover_devices_enhanced(interface=None, subnet=None):
+    """Enhanced nmap discovery with OS detection (requires sudo)"""
+    if not subnet and interface:
+        subnet = get_hotspot_subnet(interface)
+    elif not subnet:
+        subnet = "10.42.0.0/24"
+        
+    try:
+        # -O: Enable OS detection
+        # -F: Fast mode
+        # --osscan-limit: Limit OS detection to promising hosts
+        cmd = ["nmap", "-O", "-F", "--osscan-limit", subnet]
+        result = run_sudo_command(cmd, timeout=120)
+        
+        if result is None or result.returncode != 0:
+            return nmap_discover_devices(interface, subnet) # Fallback
+            
+        devices = []
+        current_host = {}
+        
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            
+            if line.startswith('Nmap scan report for'):
+                if current_host.get('ip'):
+                    devices.append(current_host)
+                current_host = {"source": "nmap-deep"}
+                
+                match = re.search(r'for\s+(?:(\S+)\s+\()?(\d+\.\d+\.\d+\.\d+)', line)
+                if match:
+                    current_host["hostname"] = match.group(1) if match.group(1) else "Unknown"
+                    current_host["ip"] = match.group(2)
+                    
+            elif line.startswith('MAC Address:'):
+                match = re.search(r'MAC Address:\s+([A-F0-9:]+)\s*(?:\((.+)\))?', line)
+                if match:
+                    current_host["mac"] = match.group(1)
+                    if match.group(2):
+                        current_host["vendor"] = match.group(2)
+                        
+            elif line.startswith('Device type:'):
+                current_host["device_type"] = line.split(':', 1)[1].strip()
+                
+            elif line.startswith('Running:'):
+                current_host["os_running"] = line.split(':', 1)[1].strip()
+                
+            elif line.startswith('OS details:'):
+                current_host["os_details"] = line.split(':', 1)[1].strip()
+                
+        if current_host.get('ip'):
+            devices.append(current_host)
+            
+        return devices, f"Deep scan found {len(devices)} devices"
+            
+    except Exception as e:
+        return nmap_discover_devices(interface, subnet)
+    
+    except Exception as e:
+        return None, str(e)
+
 
 def nmap_port_scan(ip, ports="22,80,443,8080,3389"):
     """Quick port scan on a specific device"""
@@ -480,8 +541,83 @@ def get_available_tools():
         "nmap": check_tool_available("nmap"),
         "arp": check_tool_available("arp"),
         "ip": check_tool_available("ip"),
+        "python3": check_tool_available("python3"),
     }
     return tools
+
+
+def scan_network_scapy(interface):
+    """Run the helper scapy scanner script with sudo"""
+    scanner_script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scanner_scapy.py")
+    
+    if not os.path.exists(scanner_script):
+        return None, "Scanner script not found"
+        
+    try:
+        # Get subnet for interface
+        subnet = get_hotspot_subnet(interface)
+        if not subnet:
+            return None, "Could not determine subnet"
+            
+        cmd = ["python3", scanner_script, subnet, "--interface", interface]
+        result = run_sudo_command(cmd, timeout=30)
+        
+        if result is None:
+            return None, "Scan timed out"
+            
+        if result.returncode != 0:
+            return None, f"Scan failed: {result.stderr}"
+            
+        try:
+            devices = json.loads(result.stdout)
+            if "error" in devices:
+                return None, devices["error"]
+                
+             # Add extra fields
+            for dev in devices:
+                dev["hostname"] = get_hostname(dev["ip"])
+                if "vendor" not in dev:
+                     dev["vendor"] = get_mac_vendor(dev["mac"])
+                dev["source"] = "Scapy"
+                
+            return devices, f"Scapy found {len(devices)} devices"
+        except json.JSONDecodeError:
+            return None, "Invalid JSON output from scanner"
+            
+    except Exception as e:
+        return None, str(e)
+
+
+def parse_ip_neighbor():
+    """Parse 'ip neighbor' command output"""
+    devices = []
+    try:
+        result = subprocess.run(["ip", "neigh"], capture_output=True, text=True, timeout=5)
+        # 192.168.1.1 dev wlan0 lladdr 00:11:22:33:44:55 REACHABLE
+        for line in result.stdout.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 5:
+                ip = parts[0]
+                state = parts[-1]
+                
+                if state not in ["FAILED", "INCOMPLETE"]:
+                    mac = "Unknown"
+                    try:
+                        lladdr_idx = parts.index("lladdr")
+                        mac = parts[lladdr_idx + 1].upper()
+                    except ValueError:
+                        continue
+                        
+                    devices.append({
+                        "ip": ip,
+                        "mac": mac,
+                        "hostname": get_hostname(ip),
+                        "vendor": get_mac_vendor(mac),
+                        "source": "ip neigh"
+                    })
+        return devices
+    except Exception:
+        return []
 
 
 def get_connected_devices(use_nmap_fallback=True, interface=None):
@@ -502,13 +638,28 @@ def get_connected_devices(use_nmap_fallback=True, interface=None):
                         "ip": ip,
                         "mac": mac.upper(),
                         "hostname": get_hostname(ip),
-                        "vendor": get_mac_vendor(mac),
+                        "vendor": get_mac_vendor(mac.upper()),
                         "source": "ARP"
                     })
         if devices:
             detection_methods.append("ARP")
     except Exception:
         pass
+        
+    # Method 2: ip neighbor (modern Linux)
+    neigh_devices = parse_ip_neighbor()
+    if neigh_devices:
+        for nd in neigh_devices:
+            if not any(d["ip"] == nd["ip"] for d in devices):
+                devices.append(nd)
+            # Update info if Mac was unknown
+            for d in devices:
+                if d["ip"] == nd["ip"] and d["mac"] == "Unknown" and nd["mac"] != "Unknown":
+                    d["mac"] = nd["mac"]
+                    d["vendor"] = get_mac_vendor(nd["mac"])
+                    
+        if neigh_devices and "ARP" not in detection_methods:
+             detection_methods.append("IP NEIGH")
     
     # Method 2: DHCP leases (for dnsmasq-based hotspot)
     lease_files = [
@@ -544,6 +695,12 @@ def get_connected_devices(use_nmap_fallback=True, interface=None):
     
     if dhcp_found:
         detection_methods.append("DHCP")
+        
+    # Method 4: Scapy Scan (if interface provided)
+    if interface:
+        # Only run if we don't have many devices yet or specifically requested
+        # Because it requires sudo and might be slow
+        pass # Only run explicitly via button to avoid slowness on load
     
     # Method 3: nmap scan as fallback (if no devices found or explicitly requested)
     if use_nmap_fallback and len(devices) == 0 and interface:
@@ -649,9 +806,27 @@ def get_mac_vendor(mac):
         "EC:FA:BC": "Espressif",
     }
     
-    if mac and len(mac) >= 8:
+    if mac and len(mac) >= 17:
         prefix = mac[:8].upper()
-        return vendors.get(prefix, "Unknown")
+        vendor = vendors.get(prefix)
+        if vendor:
+            return vendor
+            
+        # Try online lookup with caching
+        return get_mac_vendor_online(mac)
+        
+    return "Unknown"
+
+@st.cache_data(ttl=3600*24)
+def get_mac_vendor_online(mac):
+    """Get MAC vendor from online API"""
+    try:
+        url = f"https://api.macvendors.co/{mac}"
+        response = requests.get(url, timeout=2)
+        if response.status_code == 200:
+            return response.text.strip()
+    except Exception:
+        pass
     return "Unknown"
 
 
@@ -856,13 +1031,31 @@ with st.sidebar:
                 st.error(msg)
     
     if st.button("🔎 nmap Device Scan", use_container_width=True, disabled=not tools["nmap"]):
-        with st.spinner("Scanning network..."):
+        with st.spinner("Scanning network (Quick)..."):
             devices_found, msg = nmap_discover_devices(interface=interface)
             if devices_found:
                 st.session_state.nmap_devices = devices_found
                 st.success(msg)
             else:
                 st.error(msg)
+                
+    if st.button("🧬 Deep Scan (Scapy + Nmap OS)", use_container_width=True):
+         with st.spinner("Running deep scan (this may take a moment)..."):
+            # Run Scapy
+            scapy_devs, s_msg = scan_network_scapy(interface)
+            if scapy_devs:
+                st.session_state.scapy_devices = scapy_devs
+                st.success(s_msg)
+                
+            # Run Nmap OS detection
+            if tools["nmap"]:
+                nmap_devs, n_msg = nmap_discover_devices_enhanced(interface=interface)
+                if nmap_devs:
+                     st.session_state.nmap_devices = nmap_devs
+                     if "os_details" in nmap_devs[0]:
+                         st.info(n_msg + " with OS details")
+            
+            st.rerun()
 
 # =============================================================================
 # Main Content
@@ -906,9 +1099,28 @@ if hasattr(st.session_state, 'detection_methods') and st.session_state.detection
 # Show nmap devices if available in session state
 if 'nmap_devices' in st.session_state and st.session_state.nmap_devices:
     # Merge nmap devices with existing
+    # Merge nmap devices with existing
     for nmap_dev in st.session_state.nmap_devices:
-        if not any(d["ip"] == nmap_dev["ip"] for d in devices):
+        existing = next((d for d in devices if d["ip"] == nmap_dev["ip"]), None)
+        if existing:
+            # Update with better info
+             if nmap_dev.get("mac") != "Unknown": existing["mac"] = nmap_dev["mac"]
+             if nmap_dev.get("vendor") != "Unknown": existing["vendor"] = nmap_dev["vendor"]
+             if nmap_dev.get("os_details"): existing["os"] = nmap_dev["os_details"]
+             if nmap_dev.get("device_type"): existing["type"] = nmap_dev.get("device_type")
+        else:
             devices.append(nmap_dev)
+
+# Show Scapy devices
+if 'scapy_devices' in st.session_state and st.session_state.scapy_devices:
+     for s_dev in st.session_state.scapy_devices:
+        existing = next((d for d in devices if d["ip"] == s_dev["ip"]), None)
+        if existing:
+            if s_dev.get("mac") and existing.get("mac") == "Unknown":
+                existing["mac"] = s_dev["mac"]
+                existing["vendor"] = s_dev["vendor"]
+        else:
+            devices.append(s_dev)
 
 if devices:
     device_ips = [d["ip"] for d in devices]
