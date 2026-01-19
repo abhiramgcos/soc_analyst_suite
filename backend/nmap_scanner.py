@@ -92,30 +92,73 @@ def scan_network(
         start_time = datetime.now()
         
         # Build command
-        cmd = [nmap_path] + options.split() + ["-oX", "-", subnet]
-        logger.info(f"Running Nmap: {' '.join(cmd)}")
+        # Use sudo if available/configured for better results (OS detection, MAC addresses)
+        from config import SUDO_PASSWORD
+        use_sudo = False
         
-        # Run scan
-        process = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600  # 10 minute timeout
-        )
+        # Check if we need root (for -O or -sS which is default for root)
+        needs_root = "-O" in options or "-sS" in options or "-sU" in options
+        
+        base_cmd = [nmap_path] + options.split() + ["-oX", "-", subnet]
+        
+        if needs_root and SUDO_PASSWORD:
+             cmd = f"echo '{SUDO_PASSWORD}' | sudo -S " + " ".join(base_cmd)
+             use_sudo = True
+             logger.info(f"Running Nmap (sudo): {' '.join(base_cmd)}")
+             
+             process = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=600
+            )
+        else:
+             logger.info(f"Running Nmap: {' '.join(base_cmd)}")
+             process = subprocess.run(
+                base_cmd,
+                capture_output=True,
+                text=True,
+                timeout=600
+            )
+            
+        # Check for errors or need for fallback
+        if process.returncode != 0:
+            stderr = process.stderr if process.stderr else ""
+            
+            # If privileged scan failed, try basic scan
+            if use_sudo or "root" in stderr.lower() or "privileges" in stderr.lower() or "dnet" in stderr.lower():
+                 logger.warning(f"Nmap privileged scan failed ({stderr[:50]}...), falling back to basic scan")
+                 
+                 # Remove root-only options
+                 basic_options = "-sV --version-light -F -T4 --open" # Service scan, fast, no OS det
+                 base_cmd = [nmap_path] + basic_options.split() + ["-oX", "-", subnet]
+                 
+                 process = subprocess.run(
+                    base_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
         
         if process.returncode != 0 and not process.stdout:
             result["error"] = f"Nmap failed: {process.stderr}"
             return result
         
         # Parse XML output
-        devices = parse_nmap_xml(process.stdout)
-        
-        result["success"] = True
-        result["devices"] = devices
-        result["scan_time"] = (datetime.now() - start_time).total_seconds()
-        result["hosts_up"] = len(devices)
-        
-        logger.info(f"Scan completed: {len(devices)} devices found")
+        if process.stdout.strip().startswith("<?xml"):
+            devices = parse_nmap_xml(process.stdout)
+            
+            result["success"] = True
+            result["devices"] = devices
+            result["scan_time"] = (datetime.now() - start_time).total_seconds()
+            result["hosts_up"] = len(devices)
+            
+            logger.info(f"Scan completed: {len(devices)} devices found")
+        else:
+            result["error"] = "Invalid Nmap XML output"
+            if process.stderr:
+                 result["error"] += f": {process.stderr}"
         
     except subprocess.TimeoutExpired:
         result["error"] = "Scan timed out (10 minutes)"
@@ -126,6 +169,44 @@ def scan_network(
         logger.error(f"Nmap scan error: {e}")
     
     return result
+
+def scan_with_scapy(subnet: str, interface: Optional[str] = None) -> List[Dict]:
+    """
+    Run the Scapy ARP scanner helper script
+    """
+    import json
+    import os
+    
+    scanner_script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scanner_scapy.py")
+    if not os.path.exists(scanner_script):
+        logger.error(f"Scapy scanner script not found at {scanner_script}")
+        return []
+        
+    try:
+        cmd = ["sudo", "python3", scanner_script, subnet]
+        if interface:
+            cmd.extend(["--interface", interface])
+            
+        # Use existing SUDO_PASSWORD if available
+        from config import SUDO_PASSWORD
+        if SUDO_PASSWORD:
+             full_cmd = f"echo '{SUDO_PASSWORD}' | sudo -S python3 {scanner_script} {subnet}"
+             if interface:
+                 full_cmd += f" --interface {interface}"
+             
+             result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=60)
+        else:
+             # Try sudo without password
+             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+             
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+        else:
+            logger.error(f"Scapy scan failed: {result.stderr}")
+            return []
+    except Exception as e:
+        logger.error(f"Scapy scan error: {e}")
+        return []
 
 
 def parse_nmap_xml(xml_output: str) -> List[Dict]:

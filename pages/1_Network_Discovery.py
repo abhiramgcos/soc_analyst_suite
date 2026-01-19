@@ -12,7 +12,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import DEFAULT_SUBNET, NMAP_PATH
 from backend.db import list_devices, upsert_device, delete_device, get_device_stats
-from backend.nmap_scanner import scan_network, quick_scan
+from backend.nmap_scanner import scan_network, quick_scan, scan_with_scapy
+import requests
+
+@st.cache_data(ttl=3600*24)
+def get_mac_vendor_online(mac):
+    """Get MAC vendor from online API"""
+    try:
+        url = f"https://api.macvendors.co/{mac}"
+        response = requests.get(url, timeout=2)
+        if response.status_code == 200:
+            return response.text.strip()
+    except Exception:
+        pass
+    return "Unknown"
 
 st.set_page_config(page_title="Network Discovery", page_icon="🔍", layout="wide")
 
@@ -28,7 +41,7 @@ with col1:
     subnet = st.text_input("Target Subnet", value=DEFAULT_SUBNET, placeholder="192.168.1.0/24")
 
 with col2:
-    scan_type = st.selectbox("Scan Type", ["Quick (Ping)", "Standard (Service Detection)", "Intensive"])
+    scan_type = st.selectbox("Scan Type", ["Quick (Ping)", "Standard (Service Detection)", "Intensive", "Deep Scan (OS + Scapy)"])
 
 with col3:
     st.markdown("<br>", unsafe_allow_html=True)
@@ -48,8 +61,42 @@ if scan_button and not st.session_state.scan_in_progress:
         if scan_type == "Quick (Ping)":
             result = quick_scan(subnet)
         else:
-            options = "-sV -O -T4 --open" if scan_type == "Standard (Service Detection)" else "-sV -sC -O -A -T4 --open"
+            if scan_type == "Deep Scan (OS + Scapy)":
+                options = "-sV -O -A -T4 --open"
+            else:
+                 options = "-sV -O -T4 --open" if scan_type == "Standard (Service Detection)" else "-sV -sC -O -A -T4 --open"
+            
             result = scan_network(subnet, options=options)
+            
+            # If Deep Scan, also run Scapy to ensure we get MACs even if Nmap failed (e.g. different subnet/layer 2 issues)
+            if scan_type == "Deep Scan (OS + Scapy)" and result["success"]:
+                 st.info("Running parallel Scapy scan for accurate MAC detection...")
+                 scapy_devices = scan_with_scapy(subnet)
+                 
+                 # Merge Scapy results
+                 if scapy_devices:
+                     for s_dev in scapy_devices:
+                         # Find matching device in result
+                         existing = next((d for d in result["devices"] if d["ip"] == s_dev["ip"]), None)
+                         if existing:
+                             if existing["mac"] == "Unknown":
+                                 existing["mac"] = s_dev.get("mac", "Unknown")
+                                 existing["vendor"] = s_dev.get("vendor", "Unknown")
+                         else:
+                             # Add new device found only by Scapy
+                             result["devices"].append({
+                                 "ip": s_dev["ip"],
+                                 "mac": s_dev.get("mac", "Unknown"),
+                                 "hostname": "",
+                                 "device_type": "Unknown",
+                                 "os": "Unknown",
+                                 "ports": [],
+                                 "risk_score": 0.0,
+                                 "tags": ["scapy-discovered"],
+                                 "vendor": s_dev.get("vendor", "Unknown")
+                             })
+    
+                     st.write(f"Scapy scan enriched {len(scapy_devices)} devices")
     
     st.session_state.scan_in_progress = False
     st.session_state.scan_results = result
@@ -58,6 +105,12 @@ if scan_button and not st.session_state.scan_in_progress:
         # Save devices to database
         saved_count = 0
         for device in result["devices"]:
+            # Enrich vendor if unknown
+            if device.get("mac") and len(device["mac"]) > 8 and (not device.get("vendor") or device["vendor"] == "Unknown"):
+                 vendor = get_mac_vendor_online(device["mac"])
+                 if vendor != "Unknown":
+                     device["vendor"] = vendor
+            
             if upsert_device(device):
                 saved_count += 1
         st.success(f"✅ Scan complete! Found {len(result['devices'])} devices, saved {saved_count} to database.")
